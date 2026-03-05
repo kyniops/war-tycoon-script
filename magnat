@@ -68,35 +68,45 @@ local function findCashGiver(tycoon)
     local essentials = tycoon:FindFirstChild("Essentials")
     if not essentials then return nil end
     
-    -- Recherche intelligente du collecteur
+    -- Recherche spécifique basée sur le scan (CollectorParts -> Collector)
+    -- Le scan a montré que le pad principal est dans Essentials -> CollectorParts -> Collector
+    
+    -- 1. Essai direct (Chemin exact)
+    local collectorParts = essentials:FindFirstChild("CollectorParts")
+    if collectorParts then
+        local exactCollector = collectorParts:FindFirstChild("Collector")
+        if exactCollector and exactCollector:IsA("BasePart") then
+            return exactCollector
+        end
+    end
+    
+    -- 2. Recherche par nom exact "Collector" (Vert pur)
+    -- On cherche n'importe quelle part nommée "Collector" qui est verte
+    -- MAIS on exclut celles qui sont trop basses (Bunker) si on en trouve plusieurs
+    
+    local candidates = {}
     for _, descendant in ipairs(essentials:GetDescendants()) do
-         if descendant:IsA("BasePart") then
-             local name = string.lower(descendant.Name)
-             
-             -- 1. Par Nom
-             if name == "collector" or name == "giver" or name == "cashcollector" then
-                 -- Vérification supplémentaire par couleur (Vert pur) si le nom est générique
-                 if name == "collector" then
-                     local col = descendant.Color
-                     if col.G > 0.9 and col.R < 0.1 and col.B < 0.1 then
-                         return descendant
-                     end
-                 else
-                     return descendant
-                 end
-             end
-             
-             -- 2. Fallback par Couleur (Vert pur) si le nom n'est pas standard
+         if descendant:IsA("BasePart") and descendant.Name == "Collector" then
              local col = descendant.Color
-             if col.G > 0.8 and col.R < 0.2 and col.B < 0.2 then
-                 -- On vérifie que ce n'est pas un bouton d'achat
-                 if not descendant.Parent:FindFirstChild("Button") then
-                      return descendant
-                 end
+             -- Vert pur (0, 1, 0)
+             if col.G > 0.9 and col.R < 0.1 and col.B < 0.1 then
+                 table.insert(candidates, descendant)
              end
          end
     end
-    return nil
+    
+    -- On prend le plus haut (Y le plus grand) pour être sûr d'être à la surface
+    local bestGiver = nil
+    local bestY = -99999
+    
+    for _, cand in ipairs(candidates) do
+        if cand.Position.Y > bestY then
+            bestY = cand.Position.Y
+            bestGiver = cand
+        end
+    end
+    
+    return bestGiver
 end
 
 local function storeSellPosition()
