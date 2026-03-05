@@ -30,7 +30,7 @@ local FARM_CONFIG = {
     TeleportDelay = 2,
     RecupCrate = 7,
     SellCrate = 7,
-    BlacklistTimeout = 5,    -- Temps avant blacklist permanente
+    BlacklistTimeout = 1,    -- Temps avant blacklist permanente (1s)
     CashCollectInterval = 10 -- Intervalle de collecte d'argent
 }
 
