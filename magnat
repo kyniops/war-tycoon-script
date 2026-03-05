@@ -192,11 +192,17 @@ local function collectAndSellCrate(isFallback)
             local randomIndex = math.random(1, #availableCrates)
             local crate = availableCrates[randomIndex]
             
-            -- Vérification d'arrêt
-            if isFallback then
-                if not isFarming then return end
-            else
-                if not isCrateFarming then return end
+            -- Vérification d'arrêt IMPORTANTE
+            -- Si on est en mode "Vol Caisses", on vérifie isCrateFarming
+            if not isFallback and not isCrateFarming then 
+                isProcessing = false
+                return 
+            end
+            
+            -- Si on était en mode "AutoBuy Fallback" (plus utilisé mais au cas où)
+            if isFallback and not isFarming then 
+                isProcessing = false
+                return 
             end
             
             updateStatus("Vol Caisse (Aléatoire)...")
@@ -219,8 +225,16 @@ local function collectAndSellCrate(isFallback)
                 task.wait(FARM_CONFIG.SellCrate)
                 VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
                 task.wait(2)
+            else
+                updateStatus("Erreur: Point de vente introuvable")
+                task.wait(2)
             end
+        else
+            updateStatus("Aucune caisse trouvée")
+            task.wait(1)
         end
+    else
+        updateStatus("Système de caisses introuvable")
     end
     isProcessing = false
     updateStatus("En attente...")
