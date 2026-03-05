@@ -1,0 +1,527 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local Workspace = game:GetService("Workspace")
+
+local plr = Players.LocalPlayer
+
+-- ==============================================================================
+-- 🎨 CONFIGURATION INTERFACE & STYLE
+-- ==============================================================================
+local UI_CONFIG = {
+    Title = "WAR TYCOON",
+    Colors = {
+        Background = Color3.fromRGB(25, 25, 25),
+        Header = Color3.fromRGB(35, 35, 35),
+        Text = Color3.fromRGB(240, 240, 240),
+        ButtonOff = Color3.fromRGB(45, 45, 45),
+        ButtonOn = Color3.fromRGB(60, 180, 80), -- Vert agréable
+        ButtonRed = Color3.fromRGB(180, 60, 60), -- Rouge agréable
+        Stroke = Color3.fromRGB(60, 60, 60)
+    },
+    Sizes = {
+        Main = UDim2.new(0, 220, 0, 180),
+        Corner = UDim.new(0, 8)
+    }
+}
+
+local FARM_CONFIG = {
+    CashTarget = 0,
+    TeleportDelay = 2,
+    RecupCrate = 7,
+    SellCrate = 7,
+    BlacklistTimeout = 5,    -- Temps avant blacklist permanente
+    CashCollectInterval = 10 -- Intervalle de collecte d'argent
+}
+
+-- ==============================================================================
+-- 🛠️ FONCTIONS UTILITAIRES
+-- ==============================================================================
+local function getRoot()
+    local char = plr.Character or plr.CharacterAdded:Wait()
+    return char:WaitForChild("HumanoidRootPart")
+end
+
+local function getCurrentCash()
+    local stats = plr:FindFirstChild("leaderstats")
+    local cash = stats and stats:FindFirstChild("Cash")
+    return cash and cash.Value or 0
+end
+
+local function findPlayerTycoon()
+    local tycoons = Workspace:FindFirstChild("Tycoon") and Workspace.Tycoon:FindFirstChild("Tycoons")
+    if not tycoons then tycoons = Workspace:FindFirstChild("Tycoons") end
+    
+    if tycoons then
+        for _, tycoon in ipairs(tycoons:GetChildren()) do
+            if (tycoon:FindFirstChild("Owner") and tycoon.Owner.Value == plr) or
+               (tycoon:FindFirstChild("Owner") and tycoon.Owner:IsA("ObjectValue") and tycoon.Owner.Value == plr) or
+               (tycoon:FindFirstChild("Owner") and tycoon.Owner:IsA("StringValue") and tycoon.Owner.Value == plr.Name) then
+                return tycoon
+            end
+        end
+    end
+    return nil
+end
+
+local function findCashGiver(tycoon)
+    local essentials = tycoon:FindFirstChild("Essentials")
+    if not essentials then return nil end
+    
+    -- Recherche intelligente du collecteur
+    for _, descendant in ipairs(essentials:GetDescendants()) do
+         if descendant:IsA("BasePart") then
+             local name = string.lower(descendant.Name)
+             
+             -- 1. Par Nom
+             if name == "collector" or name == "giver" or name == "cashcollector" then
+                 -- Vérification supplémentaire par couleur (Vert pur) si le nom est générique
+                 if name == "collector" then
+                     local col = descendant.Color
+                     if col.G > 0.9 and col.R < 0.1 and col.B < 0.1 then
+                         return descendant
+                     end
+                 else
+                     return descendant
+                 end
+             end
+             
+             -- 2. Fallback par Couleur (Vert pur) si le nom n'est pas standard
+             local col = descendant.Color
+             if col.G > 0.8 and col.R < 0.2 and col.B < 0.2 then
+                 -- On vérifie que ce n'est pas un bouton d'achat
+                 if not descendant.Parent:FindFirstChild("Button") then
+                      return descendant
+                 end
+             end
+         end
+    end
+    return nil
+end
+
+local function storeSellPosition()
+    local tycoon = findPlayerTycoon()
+    if not tycoon then return false end
+    
+    local essentials = tycoon:FindFirstChild("Essentials")
+    if essentials then
+        -- Cherche le collecteur d'huile pour la vente des caisses
+        for _, desc in ipairs(essentials:GetDescendants()) do
+            if desc.Name == "Plane" and desc.Parent.Name == "Collector" then
+                FARM_CONFIG.SellPosition = desc.CFrame * CFrame.new(0, 3, 0)
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- ==============================================================================
+-- 🧠 LOGIQUE D'ANALYSE DES BOUTONS (FILTRE ROBUX)
+-- ==============================================================================
+local function isBuyButton(btn)
+    local neon = btn:FindFirstChild("Neon") or btn:FindFirstChild("Button")
+    if neon and neon:IsA("BasePart") then
+        local color = neon.Color
+        local h, s, v = color:ToHSV()
+        
+        -- 1. VERT (Classique)
+        if h > 0.25 and h < 0.45 then return true end
+        
+        -- 2. BLEU (Véhicules)
+        if h > 0.55 and h < 0.72 then return true end
+        
+        -- 3. JAUNE (Renaissance UNIQUEMENT)
+        if h > 0.12 and h < 0.20 then
+             local name = string.lower(btn.Name)
+             local parentName = btn.Parent and string.lower(btn.Parent.Name) or ""
+             
+             if string.find(name, "rebirth") or string.find(name, "renaissance") or 
+                string.find(parentName, "rebirth") or string.find(parentName, "renaissance") then
+                 return true 
+             end
+        end
+    end
+    return false
+end
+
+-- ==============================================================================
+-- 🚀 MOTEUR D'AUTOFARM
+-- ==============================================================================
+local ScreenGui -- Référence globale pour vérifier l'existence
+local StatusLabel -- Référence pour le label de statut
+
+local function updateStatus(text)
+    if StatusLabel then
+        StatusLabel.Text = "Statut: " .. text
+    end
+end
+
+local function collectAndSellCrate(isFallback)
+    if isProcessing then return end
+    isProcessing = true
+    updateStatus("Recherche Caisse...")
+    
+    local crates = Workspace:FindFirstChild("Game Systems") and Workspace["Game Systems"]:FindFirstChild("Crate Workspace")
+    
+    if crates then
+        -- On récupère toutes les caisses disponibles dans une liste
+        local availableCrates = {}
+        for _, crate in ipairs(crates:GetChildren()) do
+            if crate.Name:find("Crate") and crate:IsA("BasePart") then
+                local owner = crate:GetAttribute("Owner")
+                if not owner or tostring(owner) ~= plr.Name then
+                     table.insert(availableCrates, crate)
+                end
+            end
+        end
+        
+        -- Si on a des caisses, on en choisit une AU HASARD
+        if #availableCrates > 0 then
+            -- Mélange un peu pour éviter de prendre toujours la même si le random est faible
+            local randomIndex = math.random(1, #availableCrates)
+            local crate = availableCrates[randomIndex]
+            
+            -- Vérification d'arrêt
+            if isFallback then
+                if not isFarming then return end
+            else
+                if not isCrateFarming then return end
+            end
+            
+            updateStatus("Vol Caisse (Aléatoire)...")
+            local root = getRoot()
+            root.CFrame = crate.CFrame * CFrame.new(3, 0, 0)
+            task.wait(2)
+            
+            VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+            task.wait(FARM_CONFIG.RecupCrate)
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+            
+            task.wait(2)
+            
+            if not FARM_CONFIG.SellPosition then storeSellPosition() end
+            if FARM_CONFIG.SellPosition then
+                updateStatus("Vente Caisse...")
+                root.CFrame = FARM_CONFIG.SellPosition
+                task.wait(2)
+                VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+                task.wait(FARM_CONFIG.SellCrate)
+                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+                task.wait(2)
+            end
+        end
+    end
+    isProcessing = false
+    updateStatus("En attente...")
+end
+
+local function stopAll()
+    isFarming = false
+    isCrateFarming = false
+    isProcessing = false -- CORRECTION CRITIQUE : Débloquer l'état
+    updateStatus("Arrêté")
+    
+    if farmingConnection then 
+        farmingConnection:Disconnect() 
+        farmingConnection = nil 
+    end
+    if crateThread then 
+        task.cancel(crateThread) -- Force l'arrêt immédiat
+        crateThread = nil 
+    end
+end
+
+local function showBigMessage(text)
+    -- Création du ScreenGui temporaire
+    local msgGui = Instance.new("ScreenGui")
+    msgGui.Name = "BigMessageGUI"
+    msgGui.Parent = game.CoreGui
+    msgGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    
+    local label = Instance.new("TextLabel")
+    label.Name = "Message"
+    label.Size = UDim2.new(1, 0, 0, 100)
+    label.Position = UDim2.new(0, 0, 0.4, 0) -- Milieu de l'écran
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.TextColor3 = Color3.fromRGB(255, 255, 255) -- Blanc
+    label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0) -- Bordure Noire
+    label.TextStrokeTransparency = 0 -- Bordure opaque (très visible)
+    label.Font = Enum.Font.FredokaOne -- Police grasse et impactante
+    label.TextSize = 60
+    label.Parent = msgGui
+    
+    -- Animation d'apparition/disparition
+    task.spawn(function()
+        -- Effet de zoom in
+        for i = 0, 1, 0.1 do
+            label.TextTransparency = 1 - i
+            label.TextStrokeTransparency = 1 - i
+            task.wait(0.03)
+        end
+        
+        task.wait(2) -- Reste affiché 2 secondes
+        
+        -- Effet de zoom out
+        for i = 0, 1, 0.1 do
+            label.TextTransparency = i
+            label.TextStrokeTransparency = i
+            task.wait(0.03)
+        end
+        
+        msgGui:Destroy()
+    end)
+end
+
+local function startAutoFarm()
+    if isFarming then return end
+    stopAll() -- Arrête tout le reste
+    isFarming = true
+    updateStatus("Démarrage AutoBuy...")
+    showBigMessage("Amadou Pro Tool is better") -- Message personnalisé
+    
+    local blacklist = {}
+    local lastTarget = nil
+    local lastTargetTime = 0
+    local lastCashCollectTime = 0
+    local isCollectingCash = false -- Flag pour éviter le spam
+    
+    farmingConnection = RunService.Heartbeat:Connect(function()
+        -- 1. Sécurité GUI
+        if not ScreenGui or not ScreenGui.Parent then
+            stopAll()
+            return
+        end
+        
+        -- 2. Sécurité État
+        if not isFarming then
+            if farmingConnection then farmingConnection:Disconnect() farmingConnection = nil end
+            return
+        end
+        
+        if isProcessing or isCollectingCash then return end -- Ne pas interrompre une action critique
+        
+        local currentMoney = getCurrentCash()
+        local tycoon = findPlayerTycoon()
+        local now = tick()
+        
+        -- 3. Collecte d'Argent (Toutes les 10s)
+        if now - lastCashCollectTime > FARM_CONFIG.CashCollectInterval then
+            if tycoon then
+                local giver = findCashGiver(tycoon)
+                if giver then
+                    isCollectingCash = true -- Bloque les autres actions
+                    updateStatus("Collecte Argent...")
+                    
+                    getRoot().CFrame = giver.CFrame + Vector3.new(0, 3, 0)
+                    task.wait(0.2)
+                    getRoot().CFrame = giver.CFrame -- Dedans
+                    
+                    if firetouchinterest then
+                        firetouchinterest(getRoot(), giver, 0)
+                        task.wait()
+                        firetouchinterest(getRoot(), giver, 1)
+                    end
+                    
+                    task.wait(0.5)
+                    lastCashCollectTime = now -- Reset APRÈS la collecte réussie
+                    isCollectingCash = false
+                    return -- Retour au prochain tick
+                end
+            end
+            lastCashCollectTime = now -- Reset si pas trouvé
+        end
+        
+        -- 4. Nettoyage Blacklist (Instances disparues uniquement)
+        for btn, _ in pairs(blacklist) do
+            if not btn.Parent then blacklist[btn] = nil end
+        end
+        
+        -- 5. Logique d'Achat
+        local buttons = tycoon and tycoon:FindFirstChild("UnpurchasedButtons")
+        
+        if currentMoney >= FARM_CONFIG.CashTarget and buttons then
+            local targetButton = nil
+            
+            for _, btn in ipairs(buttons:GetChildren()) do
+                if blacklist[btn] then continue end -- Ignorer boutons bloqués
+                
+                if isBuyButton(btn) then
+                    targetButton = btn
+                    break -- On prend le premier valide
+                end
+            end
+            
+            if targetButton then
+                updateStatus("Achat: " .. targetButton.Name)
+                -- Gestion du blocage
+                if targetButton == lastTarget then
+                    if now - lastTargetTime > FARM_CONFIG.BlacklistTimeout then
+                        -- Bloqué > 5s -> Blacklist Permanente
+                        blacklist[targetButton] = true
+                        lastTarget = nil
+                        updateStatus("Bloqué -> Blacklist: " .. targetButton.Name)
+                        return
+                    end
+                else
+                    lastTarget = targetButton
+                    lastTargetTime = now
+                end
+                
+                local neon = targetButton:FindFirstChild("Neon") or targetButton:FindFirstChild("Button")
+                if neon then
+                    getRoot().CFrame = neon.CFrame + Vector3.new(0, 5, 0)
+                    task.wait(FARM_CONFIG.TeleportDelay)
+                end
+            else
+                lastTarget = nil
+                updateStatus("Recherche bouton...")
+            end
+        else
+            updateStatus("Pas assez d'argent / Pas de bouton")
+        end
+    end)
+end
+
+local function startCrateFarm()
+    if isCrateFarming then return end
+    stopAll() -- Arrête tout le reste
+    isCrateFarming = true
+    storeSellPosition()
+    updateStatus("Démarrage Vol Caisses...")
+    
+    crateThread = task.spawn(function()
+        while isCrateFarming do
+            if not ScreenGui or not ScreenGui.Parent then
+                isCrateFarming = false
+                break
+            end
+            collectAndSellCrate(false)
+            task.wait(1)
+        end
+        crateThread = nil
+    end)
+end
+
+-- ==============================================================================
+-- 🖥️ INTERFACE GRAPHIQUE (MODERNE & ÉPURÉE)
+-- ==============================================================================
+local guiName = "WarTycoonRefinedGUI"
+if game.CoreGui:FindFirstChild(guiName) then
+    game.CoreGui[guiName]:Destroy()
+end
+
+ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = guiName
+ScreenGui.Parent = game.CoreGui
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UI_CONFIG.Sizes.Main
+MainFrame.Position = UDim2.new(0.5, -110, 0.2, 0)
+MainFrame.BackgroundColor3 = UI_CONFIG.Colors.Background
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Draggable = true
+MainFrame.Parent = ScreenGui
+
+local MainCorner = Instance.new("UICorner")
+MainCorner.CornerRadius = UI_CONFIG.Sizes.Corner
+MainCorner.Parent = MainFrame
+
+local MainStroke = Instance.new("UIStroke")
+MainStroke.Color = UI_CONFIG.Colors.Stroke
+MainStroke.Thickness = 1.5
+MainStroke.Transparency = 0.5
+MainStroke.Parent = MainFrame
+
+-- Titre
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Name = "Title"
+TitleLabel.Size = UDim2.new(1, 0, 0, 35)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Text = UI_CONFIG.Title
+TitleLabel.TextColor3 = UI_CONFIG.Colors.Text
+TitleLabel.Font = Enum.Font.GothamBold
+TitleLabel.TextSize = 16
+TitleLabel.Parent = MainFrame
+
+local Separator = Instance.new("Frame")
+Separator.Name = "Separator"
+Separator.Size = UDim2.new(0.9, 0, 0, 1)
+Separator.Position = UDim2.new(0.05, 0, 0.25, 0)
+Separator.BackgroundColor3 = UI_CONFIG.Colors.Stroke
+Separator.BorderSizePixel = 0
+Separator.Parent = MainFrame
+
+StatusLabel = Instance.new("TextLabel")
+StatusLabel.Name = "Status"
+StatusLabel.Size = UDim2.new(1, 0, 0, 20)
+StatusLabel.Position = UDim2.new(0, 0, 0.85, 0)
+StatusLabel.BackgroundTransparency = 1
+StatusLabel.Text = "Statut: En attente..."
+StatusLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+StatusLabel.Font = Enum.Font.Gotham
+StatusLabel.TextSize = 12
+StatusLabel.Parent = MainFrame
+
+-- Fonction Création Bouton
+local function createButton(name, text, position, callback)
+    local btn = Instance.new("TextButton")
+    btn.Name = name
+    btn.Size = UDim2.new(0.9, 0, 0.28, 0)
+    btn.Position = position
+    btn.BackgroundColor3 = UI_CONFIG.Colors.ButtonOff
+    btn.Text = text
+    btn.TextColor3 = UI_CONFIG.Colors.Text
+    btn.Font = Enum.Font.GothamSemibold
+    btn.TextSize = 14
+    btn.AutoButtonColor = true
+    btn.Parent = MainFrame
+    
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = btn
+    
+    btn.MouseButton1Click:Connect(callback)
+    return btn
+end
+
+local AutoBuyBtn
+local AutoCrateBtn
+
+AutoBuyBtn = createButton("AutoBuy", "Auto Buy: OFF", UDim2.new(0.05, 0, 0.28, 0), function()
+    if isFarming then
+        stopAll()
+        AutoBuyBtn.Text = "Auto Buy: OFF"
+        AutoBuyBtn.BackgroundColor3 = UI_CONFIG.Colors.ButtonOff
+    else
+        -- Reset UI Crate
+        AutoCrateBtn.Text = "Vol Caisses: OFF"
+        AutoCrateBtn.BackgroundColor3 = UI_CONFIG.Colors.ButtonOff
+        
+        startAutoFarm()
+        AutoBuyBtn.Text = "Auto Buy: ON"
+        AutoBuyBtn.BackgroundColor3 = UI_CONFIG.Colors.ButtonOn
+    end
+end)
+
+AutoCrateBtn = createButton("AutoCrate", "Vol Caisses: OFF", UDim2.new(0.05, 0, 0.60, 0), function()
+    if isCrateFarming then
+        stopAll()
+        AutoCrateBtn.Text = "Vol Caisses: OFF"
+        AutoCrateBtn.BackgroundColor3 = UI_CONFIG.Colors.ButtonOff
+    else
+        -- Reset UI Buy
+        AutoBuyBtn.Text = "Auto Buy: OFF"
+        AutoBuyBtn.BackgroundColor3 = UI_CONFIG.Colors.ButtonOff
+        
+        startCrateFarm()
+        AutoCrateBtn.Text = "Vol Caisses: ON"
+        AutoCrateBtn.BackgroundColor3 = UI_CONFIG.Colors.ButtonOn
+    end
+end)
+
+print("✅ Script War Tycoon chargé avec succès (UI Moderne)")
