@@ -324,14 +324,22 @@ local function startAutoFarm()
                     isCollectingCash = true -- Bloque les autres actions
                     updateStatus("Collecte Argent...")
                     
-                    getRoot().CFrame = giver.CFrame + Vector3.new(0, 3, 0)
+                    -- On se TP juste A CÔTÉ (plus naturel, évite de se coincer dedans)
+                    -- +4 studs sur le côté
+                    getRoot().CFrame = giver.CFrame * CFrame.new(4, 2, 0)
                     task.wait(0.2)
-                    getRoot().CFrame = giver.CFrame -- Dedans
                     
+                    -- On utilise firetouchinterest pour toucher le pad à distance
                     if firetouchinterest then
                         firetouchinterest(getRoot(), giver, 0)
                         task.wait()
                         firetouchinterest(getRoot(), giver, 1)
+                    else
+                        -- Fallback : On touche brièvement physiquement si pas d'exploit
+                        local oldPos = getRoot().CFrame
+                        getRoot().CFrame = giver.CFrame -- Touche
+                        task.wait(0.1)
+                        getRoot().CFrame = oldPos -- Revient à côté
                     end
                     
                     task.wait(0.5)
