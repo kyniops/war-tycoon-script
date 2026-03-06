@@ -19,7 +19,7 @@ local UI_CONFIG = {
         ButtonOn = Color3.fromRGB(255, 255, 255), -- Style Toggle Blanc
         TextOn = Color3.fromRGB(20, 20, 25),      -- Texte noir quand ON
         Stroke = Color3.fromRGB(50, 50, 60),
-        Timer = Color3.fromRGB(255, 200, 50)      -- Orange
+        Timer = Color3.fromRGB(255, 255, 255)      -- Blanc
     },
     Sizes = {
         Main = UDim2.new(0, 240, 0, 190), -- Taille compacte originale légèrement ajustée
@@ -211,40 +211,13 @@ local function collectAndSellCrate(isFallback)
                 
                 if not isFallback and not isCrateFarming then return end
                 
-                updateStatus("Vol Caisse (Fantôme)...")
+                updateStatus("Vol Caisse...")
                 local root = getRoot()
-                local char = plr.Character
                 
                 if crate and crate.CFrame then
-                    -- 1. TP AU CENTRE (DANS LA CAISSE)
-                    root.CFrame = crate.CFrame
-                    
-                    -- 2. ANTI-GRAVITÉ STABLE (BodyVelocity au lieu de Anchor)
-                    -- Cela empêche de tomber sans faire bugger la physique
-                    local bv = Instance.new("BodyVelocity")
-                    bv.Name = "GhostHold"
-                    bv.Velocity = Vector3.new(0, 0, 0)
-                    bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-                    bv.Parent = root
-                    
-                    -- 3. NOCLIP (Traverser les murs)
-                    -- On empêche la caisse de nous éjecter
-                    local noclipConnection
-                    noclipConnection = RunService.Stepped:Connect(function()
-                        if char then
-                            for _, part in ipairs(char:GetDescendants()) do
-                                if part:IsA("BasePart") and part.CanCollide then
-                                    part.CanCollide = false
-                                end
-                            end
-                        end
-                    end)
-                    
-                    -- Nettoyage automatique après le vol
-                    task.delay(FARM_CONFIG.RecupCrate + 1, function()
-                        if noclipConnection then noclipConnection:Disconnect() end
-                        if bv then bv:Destroy() end
-                    end)
+                    -- TP simple à côté de la caisse
+                    -- Plus aucun blocage ni fantôme
+                    root.CFrame = crate.CFrame * CFrame.new(3, 1, 0)
                 else
                     return
                 end
@@ -252,7 +225,20 @@ local function collectAndSellCrate(isFallback)
                 task.wait(0.5)
                 
                 VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
-                task.wait(FARM_CONFIG.RecupCrate)
+                
+                -- ATTENTE INTELLIGENTE (Au lieu d'attendre 5.5s bêtement)
+                -- On attend que la caisse disparaisse (signe qu'elle est prise)
+                -- Ou un maximum de 6 secondes (sécurité)
+                local startTime = tick()
+                while crate.Parent and tick() - startTime < 6 do
+                    -- On vérifie si la caisse a changé de propriétaire ou a disparu
+                    local owner = crate:GetAttribute("Owner")
+                    if owner and tostring(owner) == plr.Name then
+                        break -- C'est à nous !
+                    end
+                    task.wait(0.1)
+                end
+                
                 VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
                 
                 -- === INSTANT TP RETOUR ===
@@ -475,18 +461,19 @@ Sep.BackgroundColor3 = UI_CONFIG.Colors.Stroke
 Sep.BorderSizePixel = 0
 Sep.Parent = MainFrame
 
--- TIMER OVERLAY (Transparent)
+-- TIMER OVERLAY (Discret en haut à gauche)
 BigTimerLabel = Instance.new("TextLabel")
 BigTimerLabel.Name = "TimerOverlay"
-BigTimerLabel.Size = UDim2.new(1, 0, 1, 0)
-BigTimerLabel.Position = UDim2.new(0, 0, 0, 0)
+BigTimerLabel.Size = UDim2.new(0, 50, 0, 30)
+BigTimerLabel.Position = UDim2.new(0, 10, 0, 5) -- En haut à gauche
 BigTimerLabel.BackgroundTransparency = 1
 BigTimerLabel.Text = ""
 BigTimerLabel.TextColor3 = UI_CONFIG.Colors.Timer
-BigTimerLabel.TextTransparency = 0.8 -- Très transparent
+BigTimerLabel.TextTransparency = 0
 BigTimerLabel.Font = Enum.Font.GothamBold
-BigTimerLabel.TextSize = 120
-BigTimerLabel.ZIndex = 2 -- Au dessus des boutons
+BigTimerLabel.TextSize = 24 -- Plus petit
+BigTimerLabel.TextXAlignment = Enum.TextXAlignment.Left
+BigTimerLabel.ZIndex = 2
 BigTimerLabel.Parent = MainFrame
 
 -- Status Label
