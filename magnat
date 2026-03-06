@@ -264,27 +264,14 @@ local function getSafeScoutPosition(name)
     if tycoons then
         local t = tycoons:FindFirstChild(name)
         if t then
+            -- On utilise le Pivot du modèle
             local pivotCf = t:GetPivot()
-            local center = pivotCf.Position
             
-            -- Stratégie 1: Géométrique (Spawn -> Centre -> Arrière)
-            -- Le Spawn est toujours à l'entrée (Devant).
-            local essentials = t:FindFirstChild("Essentials")
-            local spawn = essentials and essentials:FindFirstChild("Spawn")
-            
-            if spawn and spawn:IsA("BasePart") then
-                local front = spawn.Position
-                local vecToBack = (center - front) -- Vecteur qui traverse la base vers l'arrière
-                local dir = vecToBack.Unit
-                
-                -- On ajoute 130 studs depuis le centre pour être bien derrière les murs
-                return CFrame.new(center + dir * 130)
-            end
-            
-            -- Stratégie 2: Fallback Local Space (Arrière du modèle)
-            -- En Roblox, +Z est l'arrière (Back), -Z est l'avant (LookVector).
-            -- On recule de 130 studs.
-            return pivotCf * CFrame.new(0, 0, 130)
+            -- POSITION FIXE EXACTE FOURNIE PAR L'UTILISATEUR
+            -- CFrame.new(5.6, 6.0, -120.3)
+            -- On inverse le Z car Roblox "Back" est +Z, mais ici -120 semble être l'arrière souhaité par l'utilisateur
+            -- On applique cette transformation relative au Pivot du Tycoon
+            return pivotCf * CFrame.new(5.6, 6.0, -120.3)
         end
     end
     return nil
@@ -320,7 +307,7 @@ local function collectAndSellCrate(isFallback)
                     
                     -- On y va pour charger les chunks voisins
                     if plr then plr:RequestStreamAroundAsync(lastPos.Position, 0.5) end
-                    root.CFrame = lastPos + Vector3.new(0, 3, 0) -- Plus bas pour être au sol
+                    root.CFrame = lastPos -- On utilise la position safe directement
                     root.AssemblyLinearVelocity = Vector3.new(0,0,0)
                     root.AssemblyAngularVelocity = Vector3.new(0,0,0)
                     
@@ -421,86 +408,81 @@ local function collectAndSellCrate(isFallback)
                     return teamsWithCrates[name] == true
                 end
                 
-                -- Check Function: Exists physically?
-                local function exists(name)
-                    return getTycoonPosition(name) ~= nil
-                end
+                -- LOGIC: PATROL MODE (Move -> Scan -> Steal)
+                -- On avance toujours vers la prochaine base, qu'il y ait des caisses ou non.
+                -- Si on trouve des caisses sur place, on les vole. Sinon on continue.
 
-                -- LOGIC:
-                -- 1. Scan Visible Forward
-                -- 2. Scan Physical Forward (Blind Jump)
-                -- 3. If Wall -> Reverse -> Repeat 1 & 2
+                -- 1. Determine Next Target
+                local nextIndex = currentIndex + FARM_STATE.Direction
                 
-                local foundTeam = nil
-                local targetTeam = findInDirection(currentIndex, FARM_STATE.Direction, hasCrates)
+                -- Ping-Pong Logic (Si on dépasse les bornes, on inverse)
+                if nextIndex > #ORDERED_TEAMS then
+                    nextIndex = #ORDERED_TEAMS - 1
+                    FARM_STATE.Direction = -1
+                    updateStatus("Demi-tour (Gauche)")
+                elseif nextIndex < 1 then
+                    nextIndex = 2
+                    FARM_STATE.Direction = 1
+                    updateStatus("Demi-tour (Droite)")
+                end
                 
-                if targetTeam then
-                    -- Found Crate Forward
-                    foundTeam = targetTeam
-                else
-                    -- No Crate Forward -> Look for Base to Scout Forward
-                    local scoutTeam = findInDirection(currentIndex, FARM_STATE.Direction, exists)
-                    
-                    if scoutTeam then
-                        -- Found Base to Scout Forward -> BLIND JUMP
-                         updateStatus("Transit: " .. scoutTeam) -- AFFICHE LA BASE DE TRANSIT
-                         FARM_STATE.LastBase = scoutTeam
-                         local nextPos = getSafeScoutPosition(scoutTeam) -- Utilise la position arrière
-                         if nextPos then
-                             local root = getRoot()
-                             if plr then plr:RequestStreamAroundAsync(nextPos.Position) end
-                             root.CFrame = nextPos + Vector3.new(0, 3, 0) -- Au sol (Derrière)
-                            root.AssemblyLinearVelocity = Vector3.new(0,0,0)
-                            root.AssemblyAngularVelocity = Vector3.new(0,0,0)
-                             task.wait(2.5)
-                             return
-                         end
-                    else
-                         -- WALL HIT (Nothing Forward) -> REVERSE
-                         FARM_STATE.Direction = FARM_STATE.Direction * -1
-                         updateStatus("Demi-tour !")
+                local nextBaseName = ORDERED_TEAMS[nextIndex]
+                
+                -- MISE A JOUR DU STATUT AVEC LE CHEMIN
+                updateStatus("Vers: " .. nextBaseName .. " (Depuis: " .. (FARM_STATE.LastBase or "Moi") .. ")")
+                
+                -- 2. MOVE TO BASE
+                -- On y va physiquement pour charger la map et voir les caisses
+                if getTycoonPosition(nextBaseName) then
+                     -- updateStatus("Transit: " .. nextBaseName) -- Redondant avec le nouveau statut
+                     FARM_STATE.LastBase = nextBaseName -- On considère qu'on est arrivé
+                     
+                     local nextPos = getSafeScoutPosition(nextBaseName)
+                     if nextPos then
+                         local root = getRoot()
+                         if plr then plr:RequestStreamAroundAsync(nextPos.Position) end
                          
-                         -- Try New Direction
-                         targetTeam = findInDirection(currentIndex, FARM_STATE.Direction, hasCrates)
-                         if targetTeam then
-                             foundTeam = targetTeam
-                         else
-                             scoutTeam = findInDirection(currentIndex, FARM_STATE.Direction, exists)
-                             if scoutTeam then
-                                 -- Blind Jump New Direction
-                                 updateStatus("Transit: " .. scoutTeam) -- AFFICHE LA BASE DE TRANSIT
-                                 FARM_STATE.LastBase = scoutTeam
-                                 local nextPos = getSafeScoutPosition(scoutTeam) -- Utilise la position arrière
-                                 if nextPos then
-                                     local root = getRoot()
-                                     if plr then plr:RequestStreamAroundAsync(nextPos.Position) end
-                                     root.CFrame = nextPos + Vector3.new(0, 3, 0) -- Au sol (Derrière)
-                                     root.AssemblyLinearVelocity = Vector3.new(0,0,0)
-                                     root.AssemblyAngularVelocity = Vector3.new(0,0,0)
-                                     task.wait(2.5)
-                                     return
-                                 end
+                         -- Teleport
+                         root.CFrame = nextPos
+                         root.AssemblyLinearVelocity = Vector3.new(0,0,0)
+                         root.AssemblyAngularVelocity = Vector3.new(0,0,0)
+                         
+                         task.wait(1.5) -- Temps de chargement
+                         
+                         -- 3. SCAN LOCALLY
+                         -- Maintenant qu'on est sur place, on cherche une caisse DE CETTE TEAM
+                         local localCrate = nil
+                         
+                         -- Rescan crates (Simple version)
+                         local cratesContainer = Workspace:FindFirstChild("Game Systems") and Workspace["Game Systems"]:FindFirstChild("Crate Workspace")
+                         if not cratesContainer then cratesContainer = Workspace:FindFirstChild("Crate Workspace", true) end
+                         
+                         if cratesContainer then
+                             for _, crate in ipairs(cratesContainer:GetChildren()) do
+                                if crate.Name:find("Crate") and crate:IsA("BasePart") then
+                                    local owner = crate:GetAttribute("Owner")
+                                    local p = Players:FindFirstChild(tostring(owner))
+                                    if p and p.Team and p.Team.Name == nextBaseName then
+                                        localCrate = crate
+                                        break
+                                    end
+                                end
                              end
                          end
-                    end
-                end
-                
-                if foundTeam then
-                    updateStatus("Cible Trouvée: " .. foundTeam)
-                    FARM_STATE.LastBase = foundTeam -- Mémorise pour le prochain tour
-                    
-                    -- Trouver une caisse de cette team
-                    for _, crate in ipairs(availableCrates) do
-                        local owner = crate:GetAttribute("Owner")
-                        local p = Players:FindFirstChild(tostring(owner))
-                        if p and p.Team and p.Team.Name == foundTeam then
-                            targetCrate = crate
-                            break
-                        end
-                    end
+                         
+                         if localCrate then
+                             targetCrate = localCrate
+                             updateStatus("Cible: " .. nextBaseName)
+                             -- Le script va continuer vers l'étape 3 (VOL) avec cette caisse
+                         else
+                             -- Rien ici, on laisse la boucle refaire un tour -> Prochaine base
+                             return
+                         end
+                     end
                 else
-                    updateStatus("Aucune autre base trouvée")
-                    task.wait(2)
+                    -- La base n'existe pas, on avance quand même l'index pour la suite
+                    FARM_STATE.LastBase = nextBaseName
+                    task.wait(0.1)
                     return
                 end
             end
@@ -651,18 +633,31 @@ local function startAutoFarm()
                 if giver then
                     isCollectingCash = true 
                     updateStatus("Collecte Argent...")
-                    getRoot().CFrame = giver.CFrame * CFrame.new(4, 2, 0)
+                    
+                    -- On récupère le RootPart du joueur
+                    local root = getRoot()
+                    
+                    -- On sauvegarde la position actuelle (pour revenir si besoin, optionnel)
+                    -- local oldPos = root.CFrame
+                    
+                    -- On téléporte le JOUEUR vers le collecteur (au-dessus)
+                    root.CFrame = CFrame.new(giver.Position + Vector3.new(0, 5, 0))
+                    root.AssemblyLinearVelocity = Vector3.new(0,0,0) -- Stop le mouvement
+                    
                     task.wait(0.2)
+                    
                     if firetouchinterest then
-                        firetouchinterest(getRoot(), giver, 0)
+                        firetouchinterest(root, giver, 0)
                         task.wait()
-                        firetouchinterest(getRoot(), giver, 1)
+                        firetouchinterest(root, giver, 1)
                     else
-                        local oldPos = getRoot().CFrame
-                        getRoot().CFrame = giver.CFrame 
-                        task.wait(0.1)
-                        getRoot().CFrame = oldPos 
+                        -- Méthode physique : on fait descendre le JOUEUR
+                        local safePos = root.CFrame
+                        root.CFrame = giver.CFrame -- On met le joueur DANS le collecteur
+                        task.wait(0.15)
+                        root.CFrame = safePos -- On remonte le joueur
                     end
+                    
                     task.wait(0.5)
                     lastCashCollectTime = now 
                     isCollectingCash = false
@@ -698,6 +693,7 @@ local function startAutoFarm()
                 
                 local neon = targetButton:FindFirstChild("Neon") or targetButton:FindFirstChild("Button")
                 if neon then
+                    -- On se téléporte plus haut (5 studs)
                     getRoot().CFrame = neon.CFrame + Vector3.new(0, 5, 0)
                     task.wait(FARM_CONFIG.TeleportDelay)
                 end
@@ -1218,46 +1214,89 @@ btnShowBL.MouseButton1Click:Connect(function()
     end
 end)
 
--- Boucle de mise à jour de la Localisation
-task.spawn(function()
-    while ScreenGui and ScreenGui.Parent do
-        local myRoot = getRoot()
-        if myRoot then
-            local closest = "Nature"
-            local minDist = 400 -- Rayon de détection large
+    -- Bouton DEBUG : Position
+    local btnDebug = Instance.new("TextButton")
+    btnDebug.Size = UDim2.new(0, 40, 0, 20)
+    btnDebug.Position = UDim2.new(1, -45, 1, -25) -- En bas à droite
+    btnDebug.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    btnDebug.Text = "📍"
+    btnDebug.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btnDebug.Font = Enum.Font.GothamBold
+    btnDebug.TextSize = 12
+    btnDebug.Parent = MainFrame
+    
+    local cDebug = Instance.new("UICorner")
+    cDebug.CornerRadius = UDim.new(0, 4)
+    cDebug.Parent = btnDebug
+    
+    btnDebug.MouseButton1Click:Connect(function()
+        local root = getRoot()
+        local myTycoon = findPlayerTycoon()
+        
+        if root and myTycoon then
+            print("--- POSITION DEBUG ---")
+            local pivot = myTycoon:GetPivot()
+            local relCF = pivot:Inverse() * root.CFrame
             
-            -- Recherche des Tycoons
-            local tycoons = Workspace:FindFirstChild("Tycoon") and Workspace.Tycoon:FindFirstChild("Tycoons")
-            if not tycoons then tycoons = Workspace:FindFirstChild("Tycoons") end
+            print("Position actuelle (Relative au Tycoon):")
+            print(string.format("CFrame.new(%.1f, %.1f, %.1f)", relCF.X, relCF.Y, relCF.Z))
             
-            if tycoons then
-                for _, t in ipairs(tycoons:GetChildren()) do
-                    -- On utilise GetPivot pour être sûr
-                    local tRoot = t:FindFirstChild("Essentials") and t.Essentials:FindFirstChild("Spawn") 
-                    if not tRoot then tRoot = t:GetPivot().Position end
-                    
-                    local pos = (typeof(tRoot) == "Instance") and tRoot.Position or tRoot
-                    local dist = (pos - myRoot.Position).Magnitude
-                    
-                    if dist < minDist then
-                        closest = t.Name
-                        minDist = dist
+            -- Copie dans le presse-papier si possible (setclipboard)
+            if setclipboard then
+                setclipboard(string.format("CFrame.new(%.1f, %.1f, %.1f)", relCF.X, relCF.Y, relCF.Z))
+                updateStatus("Copié !")
+                task.wait(1)
+                updateStatus("Prêt")
+            else
+                updateStatus("Voir Console (F9)")
+            end
+        else
+            updateStatus("Err: Pas de Tycoon")
+        end
+    end)
+
+    -- Boucle de mise à jour de la Localisation
+    task.spawn(function()
+        while ScreenGui and ScreenGui.Parent do
+            local myRoot = getRoot()
+            if myRoot then
+                local closest = "Nature"
+                local minDist = 9999
+                
+                -- Recherche des Tycoons
+                local tycoons = Workspace:FindFirstChild("Tycoon") and Workspace.Tycoon:FindFirstChild("Tycoons")
+                if not tycoons then tycoons = Workspace:FindFirstChild("Tycoons") end
+                
+                if tycoons then
+                    for _, t in ipairs(tycoons:GetChildren()) do
+                        -- On utilise GetPivot pour être sûr
+                        local tRoot = t:FindFirstChild("Essentials") and t.Essentials:FindFirstChild("Spawn") 
+                        if not tRoot then tRoot = t:GetPivot().Position end
+                        
+                        local pos = (typeof(tRoot) == "Instance") and tRoot.Position or tRoot
+                        local dist = (pos - myRoot.Position).Magnitude
+                        
+                        if dist < minDist then
+                            closest = t.Name
+                            minDist = dist
+                        end
                     end
                 end
+                
+                -- Si on est loin de tout (> 600 studs), on reste sur "Nature"
+                if minDist > 600 then closest = "Nature" end
+
+                -- Mise à jour du texte du bouton Vol Caisses avec la localisation
+                if btnAutoCrate then
+                     if isCrateFarming then
+                         btnAutoCrate.Text = "Vol: ON (" .. closest .. ")"
+                     else
+                         btnAutoCrate.Text = "Vol: OFF (" .. closest .. ")"
+                     end
+                end
             end
-            
-            if btnAutoCrate then
-                 -- Mise à jour du texte du bouton Vol Caisses avec la localisation
-                 if isCrateFarming then
-                     btnAutoCrate.Text = "Vol Caisses: ON (" .. closest .. ")"
-                 else
-                     -- Si désactivé, on garde juste OFF
-                     btnAutoCrate.Text = "Vol Caisses: OFF"
-                 end
-            end
+            task.wait(0.5)
         end
-        task.wait(0.5)
-    end
-end)
+    end)
 
 print("✅ Interface Compacte Dave Pro chargée")
