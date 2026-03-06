@@ -5,6 +5,43 @@ local Workspace = game:GetService("Workspace")
 local TweenService = game:GetService("TweenService")
 
 local plr = Players.LocalPlayer
+local HttpService = game:GetService("HttpService") -- Service requis pour JSON
+
+-- ==============================================================================
+-- 💾 SYSTÈME DE SAUVEGARDE (BLACKLIST)
+-- ==============================================================================
+local BLACKLIST_FILE = "amadou_blacklist.json"
+
+-- Initialisation de la table globale (Noms des boutons - Strings)
+if not _G.AmadouBlacklistNames then _G.AmadouBlacklistNames = {} end
+
+local function saveBlacklist()
+    -- On vérifie si l'exécuteur supporte l'écriture de fichier
+    if writefile then
+        local success, err = pcall(function()
+            local json = HttpService:JSONEncode(_G.AmadouBlacklistNames)
+            writefile(BLACKLIST_FILE, json)
+        end)
+        if not success then warn("Erreur Sauvegarde Blacklist:", err) end
+    end
+end
+
+local function loadBlacklist()
+    -- On vérifie si le fichier existe et si on peut le lire
+    if readfile and isfile and isfile(BLACKLIST_FILE) then
+        local success, err = pcall(function()
+            local json = readfile(BLACKLIST_FILE)
+            local data = HttpService:JSONDecode(json)
+            if data and type(data) == "table" then
+                _G.AmadouBlacklistNames = data
+            end
+        end)
+        if not success then warn("Erreur Chargement Blacklist:", err) end
+    end
+end
+
+-- Charger au démarrage du script
+loadBlacklist()
 
 -- ==============================================================================
 -- 🎨 CONFIGURATION INTERFACE & STYLE (COMPACT DAVE PRO)
@@ -22,7 +59,7 @@ local UI_CONFIG = {
         Timer = Color3.fromRGB(255, 255, 255)      -- Blanc
     },
     Sizes = {
-        Main = UDim2.new(0, 240, 0, 190), -- Taille compacte originale légèrement ajustée
+        Main = UDim2.new(0, 240, 0, 280), -- Agrandissement pour le bouton Reset
         Corner = UDim.new(0, 8)
     }
 }
@@ -30,16 +67,19 @@ local UI_CONFIG = {
 local FARM_CONFIG = {
     CashTarget = 0,
     TeleportDelay = 2,
-    RecupCrate = 5.5, -- Temps réduit pour éviter l'attente inutile (C'était 7)
+    RecupCrate = 5.5, 
     SellCrate = 7,
     BlacklistTimeout = 1,
-    CashCollectInterval = 10
+    CashCollectInterval = 10,
+    TargetPlayer = nil -- Nom du joueur à cibler (String)
 }
 
 -- Variables Globales UI
 local ScreenGui
 local StatusLabel
 local BigTimerLabel
+local PlayerPopup -- Déclaration anticipée
+local btnTarget -- Bouton cible global pour mise à jour
 
 -- ==============================================================================
 -- 🛠️ FONCTIONS UTILITAIRES
@@ -136,16 +176,35 @@ local isCrateFarming = false
 local isProcessing = false
 local farmingConnection = nil
 local crateThread = nil
-local lastCrateId = nil -- Pour éviter de reprendre la même
 
 local function isBuyButton(btn)
     local neon = btn:FindFirstChild("Neon") or btn:FindFirstChild("Button")
     if neon and neon:IsA("BasePart") then
+        -- Check si c'est une récompense quotidienne (Bloqué)
+        local billboard = btn:FindFirstChild("BillboardGui") or btn:FindFirstChildOfClass("BillboardGui")
+        if billboard then
+            for _, text in pairs(billboard:GetDescendants()) do
+                if text:IsA("TextLabel") then
+                    local content = string.lower(text.Text)
+                    if string.find(content, "daily") or string.find(content, "jour") or string.find(content, "reward") or string.find(content, "recompense") then
+                        return false -- On ignore les récompenses quotidiennes
+                    end
+                end
+            end
+        end
+
         local color = neon.Color
         local h, s, v = color:ToHSV()
-        if h > 0.25 and h < 0.45 then return true end -- Vert
-        if h > 0.55 and h < 0.72 then return true end -- Bleu
-        if h > 0.12 and h < 0.20 then -- Jaune (Renaissance)
+        
+        -- Vert (Classique)
+        if h > 0.25 and h < 0.45 then return true end 
+        -- Bleu (Rebirth/Spécial)
+        if h > 0.55 and h < 0.72 then return true end 
+        -- Cyan / Bleu Ciel (Véhicules & Améliorations) - NOUVEAU
+        if h > 0.45 and h < 0.55 then return true end
+        
+        -- Jaune (Renaissance)
+        if h > 0.12 and h < 0.20 then 
              local name = string.lower(btn.Name)
              local parentName = btn.Parent and string.lower(btn.Parent.Name) or ""
              if string.find(name, "rebirth") or string.find(name, "renaissance") or 
@@ -157,89 +216,326 @@ local function isBuyButton(btn)
     return false
 end
 
+-- ==============================================================================
+-- 📦 LOGIQUE TOUR DE MAP (AUTO-FARM)
+-- ==============================================================================
+local ORDERED_TEAMS = {
+    "Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf", "Hotel", 
+    "India", "Juliet", "Kilo", "Lima", "Mike", "November", "Oscar", "Papa", 
+    "Quebec", "Romeo", "Sierra", "Tango", "Uniform", "Victor", "Whiskey", 
+    "X-ray", "Yankee", "Zulu"
+}
+
+local FARM_STATE = {
+    LastBase = nil, -- Nom de la dernière base visitée/volée
+    Direction = 1,  -- 1: Droite (Suivant), -1: Gauche (Précédent)
+    CurrentIndex = 1
+}
+
+local function getTycoonPosition(name)
+    local tycoons = Workspace:FindFirstChild("Tycoon") and Workspace.Tycoon:FindFirstChild("Tycoons")
+    if not tycoons then tycoons = Workspace:FindFirstChild("Tycoons") end
+    
+    if tycoons then
+        local t = tycoons:FindFirstChild(name)
+        if t then
+            -- On cherche un point de spawn ou le pivot pour atterrir AU SOL
+            local essentials = t:FindFirstChild("Essentials")
+            if essentials then
+                -- Priorité 1: Le Spawn Pad (Généralement au sol, à l'entrée)
+                local spawn = essentials:FindFirstChild("Spawn")
+                if spawn and spawn:IsA("BasePart") then return spawn.CFrame end
+                
+                -- Priorité 2: Le Panneau Owner (Devant la base)
+                local ownerSign = essentials:FindFirstChild("Owner")
+                if ownerSign and ownerSign:IsA("BasePart") then return ownerSign.CFrame end
+            end
+            -- Fallback: Pivot du modèle (souvent au centre, parfois en l'air)
+            return t:GetPivot()
+        end
+    end
+    return nil
+end
+
+local function getSafeScoutPosition(name)
+    local tycoons = Workspace:FindFirstChild("Tycoon") and Workspace.Tycoon:FindFirstChild("Tycoons")
+    if not tycoons then tycoons = Workspace:FindFirstChild("Tycoons") end
+    
+    if tycoons then
+        local t = tycoons:FindFirstChild(name)
+        if t then
+            local pivotCf = t:GetPivot()
+            local center = pivotCf.Position
+            
+            -- Stratégie 1: Géométrique (Spawn -> Centre -> Arrière)
+            -- Le Spawn est toujours à l'entrée (Devant).
+            local essentials = t:FindFirstChild("Essentials")
+            local spawn = essentials and essentials:FindFirstChild("Spawn")
+            
+            if spawn and spawn:IsA("BasePart") then
+                local front = spawn.Position
+                local vecToBack = (center - front) -- Vecteur qui traverse la base vers l'arrière
+                local dir = vecToBack.Unit
+                
+                -- On ajoute 130 studs depuis le centre pour être bien derrière les murs
+                return CFrame.new(center + dir * 130)
+            end
+            
+            -- Stratégie 2: Fallback Local Space (Arrière du modèle)
+            -- En Roblox, +Z est l'arrière (Back), -Z est l'avant (LookVector).
+            -- On recule de 130 studs.
+            return pivotCf * CFrame.new(0, 0, 130)
+        end
+    end
+    return nil
+end
+
+local function getMyTeamIndex()
+    local myTycoon = findPlayerTycoon()
+    if myTycoon then
+        for i, name in ipairs(ORDERED_TEAMS) do
+            if name == myTycoon.Name then return i end
+        end
+    end
+    return 1 -- Par défaut
+end
+
 local function collectAndSellCrate(isFallback)
     if isProcessing then return end
     isProcessing = true
-    updateStatus("Recherche Caisse...")
     updateBigTimer("") 
     
     -- Pré-check pour éviter le délai au retour
     if not FARM_CONFIG.SellPosition then storeSellPosition() end
     
     local success, err = pcall(function()
-        -- RECHERCHE GLOBALE ET TOTALE (SCAN TOUTE LA MAP)
-        -- On ne se limite plus à un dossier spécifique. On cherche partout.
-        updateStatus("Scan complet de la map...")
-        local allCrates = {}
         
-        -- On scanne via les PROXIMITY PROMPT (Interaction 'E')
-        -- C'est le seul moyen sûr de trouver des objets interactifs valides
-        for _, prompt in ipairs(Workspace:GetDescendants()) do
-            if prompt:IsA("ProximityPrompt") then
-                local part = prompt.Parent
-                local model = part.Parent
-                
-                -- On vérifie si c'est bien une caisse (le modèle ou la part contient "Crate")
-                if (part:IsA("BasePart") and (string.find(part.Name, "Crate") or (model and string.find(model.Name, "Crate")))) then
+        -- === ÉTAPE 0: RETOUR À LA DERNIÈRE BASE (POUR SCANNER) ===
+        -- Uniquement si on est en mode "Tour de Map" (Pas de cible manuelle)
+        if not FARM_CONFIG.TargetPlayer and FARM_STATE.LastBase then
+            updateStatus("Retour: " .. FARM_STATE.LastBase)
+            local lastPos = getSafeScoutPosition(FARM_STATE.LastBase) -- Use SafeScoutPosition instead of getTycoonPosition
+                if lastPos then
+                    local root = getRoot()
                     
-                    -- On vérifie l'attribut Owner sur le modèle ou la part
-                    local owner = part:GetAttribute("Owner") or (model and model:GetAttribute("Owner"))
+                    -- On y va pour charger les chunks voisins
+                    if plr then plr:RequestStreamAroundAsync(lastPos.Position, 0.5) end
+                    root.CFrame = lastPos + Vector3.new(0, 3, 0) -- Plus bas pour être au sol
+                    root.AssemblyLinearVelocity = Vector3.new(0,0,0)
+                    root.AssemblyAngularVelocity = Vector3.new(0,0,0)
                     
-                    -- Si pas à nous, on ajoute
+                    task.wait(2) -- Temps pour charger la map et les entités
+                end
+        end
+
+        -- === ÉTAPE 1: SCAN DES CAISSES ===
+        updateStatus("Analyse Map...")
+        local crates = nil
+        local attempts = 0
+        
+        while attempts < 3 do
+            local gameSystems = Workspace:FindFirstChild("Game Systems")
+            if gameSystems then
+                crates = gameSystems:FindFirstChild("Crate Workspace")
+                if crates then break end
+            end
+            attempts = attempts + 1
+            task.wait(0.2)
+        end
+        
+        if not crates then crates = Workspace:FindFirstChild("Crate Workspace", true) end
+        
+        if crates then
+            local availableCrates = {}
+            local teamsWithCrates = {} -- Map: TeamName -> Bool
+            
+            for _, crate in ipairs(crates:GetChildren()) do
+                if crate.Name:find("Crate") and crate:IsA("BasePart") then
+                    local owner = crate:GetAttribute("Owner")
+                    -- On exclut nos propres caisses
                     if not owner or tostring(owner) ~= plr.Name then
-                         table.insert(allCrates, part)
+                         table.insert(availableCrates, crate)
+                         
+                         -- Identification de la Team propriétaire
+                         local p = Players:FindFirstChild(tostring(owner))
+                         if p and p.Team then
+                             teamsWithCrates[p.Team.Name] = true
+                         end
                     end
                 end
             end
-        end
-        
-        if #allCrates > 0 then
-            -- Mélange de la table pour un vrai aléatoire (Fisher-Yates Shuffle)
-            for i = #allCrates, 2, -1 do
-                local j = math.random(i)
-                allCrates[i], allCrates[j] = allCrates[j], allCrates[i]
+            
+            -- Si aucune caisse, on attend
+            if #availableCrates == 0 then
+                 updateStatus("Aucune caisse...")
+                 task.wait(2)
+                 return
             end
             
-            local selectedCrate = nil
+            -- === ÉTAPE 2: SÉLECTION DE LA CIBLE ===
+            local targetCrate = nil
             
-            -- On cherche une caisse différente de la dernière
-            for _, c in ipairs(allCrates) do
-                if c ~= lastCrateId then
-                    selectedCrate = c
-                    break
+            if FARM_CONFIG.TargetPlayer then
+                -- MODE MANUEL (Cible unique)
+                for _, crate in ipairs(availableCrates) do
+                    local owner = crate:GetAttribute("Owner")
+                    if owner and tostring(owner) == FARM_CONFIG.TargetPlayer then
+                        targetCrate = crate
+                        break
+                    end
+                end
+                if not targetCrate then
+                    updateStatus("Cible vide: " .. FARM_CONFIG.TargetPlayer)
+                    task.wait(1)
+                    return
+                end
+            else
+                -- MODE TOUR DE MAP (Séquentiel - Sticky Direction)
+                
+                -- 1. Sync Index
+                local currentIndex = 1
+                if FARM_STATE.LastBase then
+                    for i, v in ipairs(ORDERED_TEAMS) do
+                        if v == FARM_STATE.LastBase then
+                            currentIndex = i
+                            break
+                        end
+                    end
+                else
+                    currentIndex = getMyTeamIndex()
+                end
+                
+                -- Helper Scan Function
+                local function findInDirection(startIdx, dir, checkFn)
+                    local i = startIdx + dir
+                    while i >= 1 and i <= #ORDERED_TEAMS do
+                        local teamName = ORDERED_TEAMS[i]
+                        if checkFn(teamName) then return teamName end
+                        i = i + dir
+                    end
+                    return nil
+                end
+                
+                -- Check Function: Has Crates?
+                local function hasCrates(name)
+                    return teamsWithCrates[name] == true
+                end
+                
+                -- Check Function: Exists physically?
+                local function exists(name)
+                    return getTycoonPosition(name) ~= nil
+                end
+
+                -- LOGIC:
+                -- 1. Scan Visible Forward
+                -- 2. Scan Physical Forward (Blind Jump)
+                -- 3. If Wall -> Reverse -> Repeat 1 & 2
+                
+                local foundTeam = nil
+                local targetTeam = findInDirection(currentIndex, FARM_STATE.Direction, hasCrates)
+                
+                if targetTeam then
+                    -- Found Crate Forward
+                    foundTeam = targetTeam
+                else
+                    -- No Crate Forward -> Look for Base to Scout Forward
+                    local scoutTeam = findInDirection(currentIndex, FARM_STATE.Direction, exists)
+                    
+                    if scoutTeam then
+                        -- Found Base to Scout Forward -> BLIND JUMP
+                         updateStatus("Transit: " .. scoutTeam) -- AFFICHE LA BASE DE TRANSIT
+                         FARM_STATE.LastBase = scoutTeam
+                         local nextPos = getSafeScoutPosition(scoutTeam) -- Utilise la position arrière
+                         if nextPos then
+                             local root = getRoot()
+                             if plr then plr:RequestStreamAroundAsync(nextPos.Position) end
+                             root.CFrame = nextPos + Vector3.new(0, 3, 0) -- Au sol (Derrière)
+                            root.AssemblyLinearVelocity = Vector3.new(0,0,0)
+                            root.AssemblyAngularVelocity = Vector3.new(0,0,0)
+                             task.wait(2.5)
+                             return
+                         end
+                    else
+                         -- WALL HIT (Nothing Forward) -> REVERSE
+                         FARM_STATE.Direction = FARM_STATE.Direction * -1
+                         updateStatus("Demi-tour !")
+                         
+                         -- Try New Direction
+                         targetTeam = findInDirection(currentIndex, FARM_STATE.Direction, hasCrates)
+                         if targetTeam then
+                             foundTeam = targetTeam
+                         else
+                             scoutTeam = findInDirection(currentIndex, FARM_STATE.Direction, exists)
+                             if scoutTeam then
+                                 -- Blind Jump New Direction
+                                 updateStatus("Transit: " .. scoutTeam) -- AFFICHE LA BASE DE TRANSIT
+                                 FARM_STATE.LastBase = scoutTeam
+                                 local nextPos = getSafeScoutPosition(scoutTeam) -- Utilise la position arrière
+                                 if nextPos then
+                                     local root = getRoot()
+                                     if plr then plr:RequestStreamAroundAsync(nextPos.Position) end
+                                     root.CFrame = nextPos + Vector3.new(0, 3, 0) -- Au sol (Derrière)
+                                     root.AssemblyLinearVelocity = Vector3.new(0,0,0)
+                                     root.AssemblyAngularVelocity = Vector3.new(0,0,0)
+                                     task.wait(2.5)
+                                     return
+                                 end
+                             end
+                         end
+                    end
+                end
+                
+                if foundTeam then
+                    updateStatus("Cible Trouvée: " .. foundTeam)
+                    FARM_STATE.LastBase = foundTeam -- Mémorise pour le prochain tour
+                    
+                    -- Trouver une caisse de cette team
+                    for _, crate in ipairs(availableCrates) do
+                        local owner = crate:GetAttribute("Owner")
+                        local p = Players:FindFirstChild(tostring(owner))
+                        if p and p.Team and p.Team.Name == foundTeam then
+                            targetCrate = crate
+                            break
+                        end
+                    end
+                else
+                    updateStatus("Aucune autre base trouvée")
+                    task.wait(2)
+                    return
                 end
             end
             
-            -- Si on n'a rien trouvé (ou une seule caisse dispo), on prend la première
-            if not selectedCrate then selectedCrate = allCrates[1] end
-            
-            lastCrateId = selectedCrate
-            
-            if not isFallback and not isCrateFarming then return end
-            
-            updateStatus("Vol Caisse (Aléatoire)...")
+            -- === ÉTAPE 3: VOL DE LA CAISSE ===
+            if targetCrate then
+                if not isFallback and not isCrateFarming then return end
+                
+                updateStatus("Vol: " .. (FARM_STATE.LastBase or "Cible"))
                 local root = getRoot()
                 
-                if selectedCrate and selectedCrate.CFrame then
+                if targetCrate and targetCrate.CFrame then
                     -- TP simple à côté de la caisse
-                    -- Plus aucun blocage ni fantôme
-                    root.CFrame = selectedCrate.CFrame * CFrame.new(3, 1, 0)
+                    if plr then plr:RequestStreamAroundAsync(targetCrate.Position) end
+                    root.CFrame = targetCrate.CFrame * CFrame.new(3, 1, 0)
                 else
                     return
                 end
                 
-                task.wait(0.2) -- Délai infime avant d'appuyer (0.2s)
+                task.wait(0.5)
                 
                 VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
                 
-                -- TEMPS DE CAPTURE FIXE ET RAPIDE
-                -- On attend juste le temps nécessaire pour remplir la barre (5.5s environ)
-                -- Dès que c'est fini, on part INSTANTANÉMENT
-                task.wait(5.5) 
+                -- ATTENTE INTELLIGENTE
+                local startTime = tick()
+                while targetCrate.Parent and tick() - startTime < 6 do
+                    if not targetCrate.Parent then break end 
+                    local owner = targetCrate:GetAttribute("Owner")
+                    if owner and tostring(owner) == plr.Name then break end
+                    task.wait() 
+                end
                 
                 VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
                 
-                -- === INSTANT TP RETOUR ===
+                -- === ÉTAPE 4: VENTE & RETOUR ===
                 if FARM_CONFIG.SafePosition then
                     updateStatus("Zone Sûre (Cooldown)")
                     root.CFrame = FARM_CONFIG.SafePosition
@@ -267,12 +563,33 @@ local function collectAndSellCrate(isFallback)
                     task.wait(FARM_CONFIG.SellCrate)
                     VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
                     task.wait(1.5)
+                    
+                    -- SI CIBLE UNIQUE: ON DÉSELECTIONNE APRÈS SUCCÈS
+                    if FARM_CONFIG.TargetPlayer then
+                        -- On mémorise cette base comme la dernière visitée
+                        -- pour que le Tour de Map continue depuis ici (vers la droite)
+                        local p = Players:FindFirstChild(FARM_CONFIG.TargetPlayer)
+                        if p and p.Team then
+                            FARM_STATE.LastBase = p.Team.Name
+                            updateStatus("Dernière Base: " .. FARM_STATE.LastBase)
+                        end
+                        
+                        -- On désactive le mode manuel pour repasser en auto
+                        FARM_CONFIG.TargetPlayer = nil
+                        if btnTarget then btnTarget.Text = "🎯" end
+                        
+                        -- Si la popup est ouverte, on refresh pour enlever la sélection visuelle
+                        if PlayerPopup and PlayerPopup.Visible then
+                            refreshPlayerList()
+                        end
+                        task.wait(1)
+                    end
                 else
                     updateStatus("Err: Pas de Base")
                     task.wait(2)
                 end
             else
-                updateStatus("Aucune caisse")
+                updateStatus("Caisse perdue")
                 task.wait(1)
             end
         else
@@ -287,7 +604,7 @@ local function collectAndSellCrate(isFallback)
     end
     
     isProcessing = false
-    if isCrateFarming then updateStatus("En attente...") else updateStatus("Arrêté") end
+    if isCrateFarming then updateStatus("Prêt") else updateStatus("Arrêté") end
 end
 
 local function stopAll()
@@ -301,13 +618,16 @@ local function stopAll()
     if crateThread then task.cancel(crateThread) crateThread = nil end
 end
 
+-- On rend la blacklist accessible globalement et persistante
+-- (Désormais gérée par _G.AmadouBlacklistNames et le système de sauvegarde)
+
 local function startAutoFarm()
     if isFarming then return end
     stopAll() 
     isFarming = true
     updateStatus("AutoBuy Actif")
     
-    local blacklist = {}
+    local blacklist = _G.AmadouBlacklistNames -- Utilise la liste globale des NOMS
     local lastTarget = nil
     local lastTargetTime = 0
     local lastCashCollectTime = 0
@@ -352,13 +672,13 @@ local function startAutoFarm()
             lastCashCollectTime = now 
         end
         
-        for btn, _ in pairs(blacklist) do if not btn.Parent then blacklist[btn] = nil end end
+        -- Plus besoin de nettoyer la blacklist (on stocke des strings persistants)
         
         local buttons = tycoon and tycoon:FindFirstChild("UnpurchasedButtons")
         if currentMoney >= FARM_CONFIG.CashTarget and buttons then
             local targetButton = nil
             for _, btn in ipairs(buttons:GetChildren()) do
-                if blacklist[btn] then continue end 
+                if blacklist[btn.Name] then continue end -- Vérifie le NOM
                 if isBuyButton(btn) then targetButton = btn break end
             end
             
@@ -366,7 +686,8 @@ local function startAutoFarm()
                 updateStatus("Achat: " .. targetButton.Name)
                 if targetButton == lastTarget then
                     if now - lastTargetTime > FARM_CONFIG.BlacklistTimeout then
-                        blacklist[targetButton] = true
+                        blacklist[targetButton.Name] = true -- Bloque le NOM
+                        saveBlacklist() -- Sauvegarde immédiate
                         lastTarget = nil
                         return
                     end
@@ -474,13 +795,17 @@ BigTimerLabel.TextXAlignment = Enum.TextXAlignment.Left
 BigTimerLabel.ZIndex = 2
 BigTimerLabel.Parent = MainFrame
 
--- Status Label
+-- LOCALISATION (Bas Droite, à côté du Status)
+-- REMPLACÉ PAR TEXTE DANS LE BOUTON VOL CAISSES
+
+-- Status Label (Gauche)
 StatusLabel = Instance.new("TextLabel")
 StatusLabel.Name = "Status"
-StatusLabel.Size = UDim2.new(1, 0, 0, 20)
-StatusLabel.Position = UDim2.new(0, 0, 0.88, 0)
+StatusLabel.Size = UDim2.new(0.9, 0, 0, 20)
+StatusLabel.Position = UDim2.new(0.05, 0, 0.88, 0) -- Centré
 StatusLabel.BackgroundTransparency = 1
 StatusLabel.Text = "Prêt"
+StatusLabel.TextXAlignment = Enum.TextXAlignment.Center
 StatusLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
 StatusLabel.Font = Enum.Font.Gotham
 StatusLabel.TextSize = 11
@@ -489,7 +814,7 @@ StatusLabel.Parent = MainFrame
 -- Fonction Toggle Compact
 local function createCompactToggle(text, yPos, callback)
     local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(0.9, 0, 0.28, 0)
+    btn.Size = UDim2.new(0.9, 0, 0.24, 0) -- Taille réduite pour loger 3 rangées
     btn.Position = UDim2.new(0.05, 0, yPos, 0)
     btn.BackgroundColor3 = UI_CONFIG.Colors.ButtonOff
     btn.Text = text
@@ -512,7 +837,7 @@ end
 local btnAutoBuy
 local btnAutoCrate
 
-btnAutoBuy = createCompactToggle("Auto Buy: OFF", 0.25, function(btn)
+btnAutoBuy = createCompactToggle("Auto Buy: OFF", 0.20, function(btn) -- Position haute
     if isFarming then
         stopAll()
         btn.Text = "Auto Buy: OFF"
@@ -530,7 +855,7 @@ btnAutoBuy = createCompactToggle("Auto Buy: OFF", 0.25, function(btn)
     end
 end)
 
-btnAutoCrate = createCompactToggle("Vol Caisses: OFF", 0.56, function(btn)
+btnAutoCrate = createCompactToggle("Vol Caisses: OFF", 0.64, function(btn) -- Position basse (sous Blacklist)
     if isCrateFarming then
         stopAll()
         btn.Text = "Vol Caisses: OFF"
@@ -545,6 +870,393 @@ btnAutoCrate = createCompactToggle("Vol Caisses: OFF", 0.56, function(btn)
         btn.Text = "Vol Caisses: ON"
         btn.BackgroundColor3 = UI_CONFIG.Colors.ButtonOn
         btn.TextColor3 = UI_CONFIG.Colors.TextOn
+    end
+end)
+
+-- REDIMENSIONNEMENT POUR LE BOUTON CIBLE
+btnAutoCrate.Size = UDim2.new(0.65, 0, 0.24, 0) -- Réduit pour faire de la place
+
+-- BOUTON CIBLE (Target)
+btnTarget = Instance.new("TextButton") -- Plus de 'local' ici
+btnTarget.Size = UDim2.new(0.20, 0, 0.24, 0)
+btnTarget.Position = UDim2.new(0.75, 0, 0.64, 0) -- À droite de Vol Caisses
+btnTarget.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+btnTarget.Text = "🎯"
+btnTarget.TextColor3 = Color3.fromRGB(255, 255, 255)
+btnTarget.Font = Enum.Font.GothamBold
+btnTarget.TextSize = 18
+btnTarget.AutoButtonColor = true
+btnTarget.Parent = MainFrame
+
+local cornerTarget = Instance.new("UICorner")
+cornerTarget.CornerRadius = UDim.new(0, 6)
+cornerTarget.Parent = btnTarget
+
+-- Popup Joueurs
+PlayerPopup = Instance.new("ScrollingFrame") -- Déclarée plus haut
+PlayerPopup.Name = "PlayerPopup"
+PlayerPopup.Size = UDim2.new(1.1, 0, 1.2, 0) -- Un peu plus haut
+PlayerPopup.Position = UDim2.new(1.05, 0, -0.1, 0) -- Centré verticalement
+PlayerPopup.BackgroundColor3 = UI_CONFIG.Colors.Background
+PlayerPopup.BorderSizePixel = 0
+PlayerPopup.Visible = false
+PlayerPopup.ScrollBarThickness = 4
+PlayerPopup.Parent = MainFrame
+
+local PLStroke = Instance.new("UIStroke")
+PLStroke.Color = UI_CONFIG.Colors.Stroke
+PLStroke.Thickness = 1.5
+PLStroke.Parent = PlayerPopup
+
+local PLCorner = Instance.new("UICorner")
+PLCorner.CornerRadius = UDim.new(0, 8)
+PLCorner.Parent = PlayerPopup
+
+local PLList = Instance.new("UIListLayout")
+PLList.Parent = PlayerPopup
+PLList.SortOrder = Enum.SortOrder.LayoutOrder
+PLList.Padding = UDim.new(0, 5)
+PLList.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+local PLPadding = Instance.new("UIPadding")
+PLPadding.PaddingTop = UDim.new(0, 10)
+PLPadding.Parent = PlayerPopup
+
+local function refreshPlayerList()
+    if not PlayerPopup.Visible then return end
+    
+    for _, c in pairs(PlayerPopup:GetChildren()) do
+        if c:IsA("TextButton") or c:IsA("TextLabel") then c:Destroy() end
+    end
+    
+    -- Titre
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(0.9, 0, 0, 20)
+    title.BackgroundTransparency = 1
+    title.Text = "CIBLER JOUEUR"
+    title.TextColor3 = UI_CONFIG.Colors.Text
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 12
+    title.Parent = PlayerPopup
+    
+    -- Bouton "TOUS / RESET"
+    local btnAll = Instance.new("TextButton")
+    btnAll.Size = UDim2.new(0.9, 0, 0, 30)
+    btnAll.BackgroundColor3 = FARM_CONFIG.TargetPlayer == nil and UI_CONFIG.Colors.ButtonOn or UI_CONFIG.Colors.ButtonOff
+    btnAll.Text = "TOUS (Reset)"
+    btnAll.TextColor3 = FARM_CONFIG.TargetPlayer == nil and UI_CONFIG.Colors.TextOn or UI_CONFIG.Colors.Text
+    btnAll.Font = Enum.Font.GothamSemibold
+    btnAll.TextSize = 12
+    btnAll.Parent = PlayerPopup
+    
+    local cAll = Instance.new("UICorner")
+    cAll.CornerRadius = UDim.new(0, 6)
+    cAll.Parent = btnAll
+    
+    btnAll.MouseButton1Click:Connect(function()
+        FARM_CONFIG.TargetPlayer = nil
+        updateStatus("Cible: TOUS")
+        btnTarget.Text = "🎯"
+        refreshPlayerList() -- Refresh pour mettre à jour les couleurs
+    end)
+    
+    -- Bouton ACTUALISER
+    local btnRefresh = Instance.new("TextButton")
+    btnRefresh.Size = UDim2.new(0.9, 0, 0, 30)
+    btnRefresh.BackgroundColor3 = Color3.fromRGB(52, 152, 219) -- Bleu
+    btnRefresh.Text = "🔄 Actualiser"
+    btnRefresh.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btnRefresh.Font = Enum.Font.GothamBold
+    btnRefresh.TextSize = 11
+    btnRefresh.Parent = PlayerPopup
+    
+    local cRefresh = Instance.new("UICorner")
+    cRefresh.CornerRadius = UDim.new(0, 6)
+    cRefresh.Parent = btnRefresh
+    
+    btnRefresh.MouseButton1Click:Connect(function()
+        refreshPlayerList()
+    end)
+
+    -- Scan des joueurs et caisses (UNIQUEMENT CHARGÉS)
+    local playersData = {}
+    local crateCounts = {}
+    
+    -- On scanne d'abord les caisses réellement présentes dans le Workspace
+    local crates = Workspace:FindFirstChild("Crate Workspace", true) or (Workspace:FindFirstChild("Game Systems") and Workspace["Game Systems"]:FindFirstChild("Crate Workspace"))
+    if crates then
+        for _, crate in ipairs(crates:GetChildren()) do
+            if crate:IsA("BasePart") then
+                local o = crate:GetAttribute("Owner")
+                if o then
+                    local sOwner = tostring(o)
+                    crateCounts[sOwner] = (crateCounts[sOwner] or 0) + 1
+                end
+            end
+        end
+    end
+    
+    -- On ne liste que les joueurs qui ont au moins 1 caisse chargée
+    for name, count in pairs(crateCounts) do
+        if name ~= plr.Name then
+            local p = Players:FindFirstChild(name)
+            local teamName = "Unknown"
+            if p and p.Team then
+                teamName = p.Team.Name
+            end
+
+            table.insert(playersData, {
+                Name = name,
+                Team = teamName,
+                Count = count
+            })
+        end
+    end
+    
+    table.sort(playersData, function(a,b) 
+        if a.Count ~= b.Count then return a.Count > b.Count end
+        return a.Name < b.Name
+    end)
+
+    if #playersData == 0 then
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(0.9, 0, 0, 25)
+        lbl.BackgroundTransparency = 1
+        lbl.Text = "Aucune caisse visible"
+        lbl.TextColor3 = Color3.fromRGB(150, 150, 150)
+        lbl.Font = Enum.Font.Gotham
+        lbl.TextSize = 11
+        lbl.Parent = PlayerPopup
+    else
+        for _, data in ipairs(playersData) do
+            local btn = Instance.new("TextButton")
+            btn.Size = UDim2.new(0.9, 0, 0, 30)
+            -- Highlight si sélectionné
+            local isSelected = (FARM_CONFIG.TargetPlayer == data.Name)
+            
+            if isSelected then
+                btn.BackgroundColor3 = Color3.fromRGB(60, 60, 70) -- Même couleur que les boutons d'action (Gris foncé)
+                btn.BackgroundTransparency = 0 -- Opaque, simple
+            else
+                btn.BackgroundColor3 = UI_CONFIG.Colors.ButtonOff
+                btn.BackgroundTransparency = 0
+            end
+            
+            -- Affichage: Pseudo [TEAM] [Nbr Caisses]
+            -- Team en MAJUSCULE, entre crochets, plus gros, blanc
+            local teamStr = string.upper(data.Team)
+            local text = data.Name .. " <font color='rgb(255,255,255)' size='14'>[" .. teamStr .. "]</font> [" .. data.Count .. " 📦]"
+            
+            btn.RichText = true
+            btn.TextColor3 = Color3.fromRGB(255, 200, 100) -- Orange car caisses présentes
+            btn.Text = text
+            btn.Font = Enum.Font.Gotham
+            btn.TextSize = 11
+            btn.Parent = PlayerPopup
+            
+            local c = Instance.new("UICorner")
+            c.CornerRadius = UDim.new(0, 6)
+            c.Parent = btn
+            
+            btn.MouseButton1Click:Connect(function()
+                FARM_CONFIG.TargetPlayer = data.Name
+                updateStatus("Cible: " .. data.Name)
+                btnTarget.Text = "🎯 " .. string.sub(data.Name, 1, 3)
+                refreshPlayerList()
+            end)
+        end
+    end
+    
+    PlayerPopup.CanvasSize = UDim2.new(0, 0, 0, (#playersData + 3) * 35 + 20)
+end
+
+btnTarget.MouseButton1Click:Connect(function()
+    PlayerPopup.Visible = not PlayerPopup.Visible
+    if PlayerPopup.Visible then
+        -- Fermer l'autre popup si ouverte
+        if BLPopup and BLPopup.Visible then BLPopup.Visible = false end
+        refreshPlayerList()
+        -- Auto Refresh (pour voir les nouveaux joueurs qui ont des caisses)
+        task.spawn(function()
+             while PlayerPopup.Visible and PlayerPopup.Parent do
+                 refreshPlayerList()
+                 task.wait(2) -- Refresh toutes les 2s pour pas spammer l'UI
+             end
+        end)
+    end
+end)
+
+-- Bouton RESET BLACKLIST (Rouge)
+local btnReset = Instance.new("TextButton")
+btnReset.Size = UDim2.new(0.65, 0, 0.15, 0) -- Réduit pour laisser place au bouton "Voir"
+btnReset.Position = UDim2.new(0.05, 0, 0.46, 0) -- Position médiane (sous AutoBuy)
+btnReset.BackgroundColor3 = Color3.fromRGB(150, 40, 40)
+btnReset.Text = "RESET BLACKLIST"
+btnReset.TextColor3 = Color3.fromRGB(255, 255, 255)
+btnReset.Font = Enum.Font.GothamBold
+btnReset.TextSize = 12
+btnReset.AutoButtonColor = true
+btnReset.Parent = MainFrame
+
+local cornerReset = Instance.new("UICorner")
+cornerReset.CornerRadius = UDim.new(0, 6)
+cornerReset.Parent = btnReset
+
+btnReset.MouseButton1Click:Connect(function()
+    if _G.AmadouBlacklistNames then
+        _G.AmadouBlacklistNames = {}
+        saveBlacklist() -- Sauvegarde vide
+        updateStatus("Blacklist Vidée !")
+        task.wait(1)
+        updateStatus("Prêt")
+    else
+        updateStatus("Rien à reset")
+    end
+end)
+
+-- Bouton VOIR BLACKLIST (Gris)
+local btnShowBL = Instance.new("TextButton")
+btnShowBL.Size = UDim2.new(0.20, 0, 0.15, 0)
+btnShowBL.Position = UDim2.new(0.75, 0, 0.46, 0) -- À droite du Reset
+btnShowBL.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+btnShowBL.Text = "👁️" -- Oeil
+btnShowBL.TextColor3 = Color3.fromRGB(255, 255, 255)
+btnShowBL.Font = Enum.Font.GothamBold
+btnShowBL.TextSize = 14
+btnShowBL.AutoButtonColor = true
+btnShowBL.Parent = MainFrame
+
+local cornerShow = Instance.new("UICorner")
+cornerShow.CornerRadius = UDim.new(0, 6)
+cornerShow.Parent = btnShowBL
+
+-- Popup Blacklist
+local BLPopup = Instance.new("ScrollingFrame")
+BLPopup.Name = "BLPopup"
+BLPopup.Size = UDim2.new(1.1, 0, 1, 0) -- Un peu plus large pour couvrir
+BLPopup.Position = UDim2.new(1.05, 0, 0, 0) -- À droite de la fenêtre principale
+BLPopup.BackgroundColor3 = UI_CONFIG.Colors.Background
+BLPopup.BorderSizePixel = 0
+BLPopup.Visible = false
+BLPopup.ScrollBarThickness = 4
+BLPopup.Parent = MainFrame
+
+local BLStroke = Instance.new("UIStroke")
+BLStroke.Color = UI_CONFIG.Colors.Stroke
+BLStroke.Thickness = 1.5
+BLStroke.Parent = BLPopup
+
+local BLCorner = Instance.new("UICorner")
+BLCorner.CornerRadius = UDim.new(0, 8)
+BLCorner.Parent = BLPopup
+
+local BLList = Instance.new("UIListLayout")
+BLList.Parent = BLPopup
+BLList.SortOrder = Enum.SortOrder.LayoutOrder
+BLList.Padding = UDim.new(0, 5)
+BLList.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+local BLPadding = Instance.new("UIPadding")
+BLPadding.PaddingTop = UDim.new(0, 10)
+BLPadding.Parent = BLPopup
+
+local function refreshBlacklistPopup()
+    if not BLPopup.Visible then return end
+    
+    -- Refresh liste
+    for _, c in pairs(BLPopup:GetChildren()) do
+        if c:IsA("TextLabel") then c:Destroy() end
+    end
+    
+    local count = 0
+    if _G.AmadouBlacklistNames then
+        -- Tri alphabétique pour plus de clarté
+        local names = {}
+        for name, _ in pairs(_G.AmadouBlacklistNames) do
+            table.insert(names, name)
+        end
+        table.sort(names)
+        
+        for _, name in ipairs(names) do
+            count = count + 1
+            local lbl = Instance.new("TextLabel")
+            lbl.Size = UDim2.new(0.9, 0, 0, 25)
+            lbl.BackgroundTransparency = 1
+            lbl.Text = name
+            lbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+            lbl.Font = Enum.Font.Gotham
+            lbl.TextSize = 11
+            lbl.Parent = BLPopup
+        end
+    end
+    
+    if count == 0 then
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(0.9, 0, 0, 25)
+        lbl.BackgroundTransparency = 1
+        lbl.Text = "Aucun item bloqué"
+        lbl.TextColor3 = Color3.fromRGB(100, 100, 100)
+        lbl.Font = Enum.Font.Gotham
+        lbl.TextSize = 11
+        lbl.Parent = BLPopup
+    end
+    BLPopup.CanvasSize = UDim2.new(0, 0, 0, count * 30 + 20)
+end
+
+btnShowBL.MouseButton1Click:Connect(function()
+    BLPopup.Visible = not BLPopup.Visible
+    
+    if BLPopup.Visible then
+        refreshBlacklistPopup()
+        -- Auto Refresh Loop
+        task.spawn(function()
+            while BLPopup.Visible and BLPopup.Parent do
+                refreshBlacklistPopup()
+                task.wait(1) -- Rafraichissement chaque seconde
+            end
+        end)
+    end
+end)
+
+-- Boucle de mise à jour de la Localisation
+task.spawn(function()
+    while ScreenGui and ScreenGui.Parent do
+        local myRoot = getRoot()
+        if myRoot then
+            local closest = "Nature"
+            local minDist = 400 -- Rayon de détection large
+            
+            -- Recherche des Tycoons
+            local tycoons = Workspace:FindFirstChild("Tycoon") and Workspace.Tycoon:FindFirstChild("Tycoons")
+            if not tycoons then tycoons = Workspace:FindFirstChild("Tycoons") end
+            
+            if tycoons then
+                for _, t in ipairs(tycoons:GetChildren()) do
+                    -- On utilise GetPivot pour être sûr
+                    local tRoot = t:FindFirstChild("Essentials") and t.Essentials:FindFirstChild("Spawn") 
+                    if not tRoot then tRoot = t:GetPivot().Position end
+                    
+                    local pos = (typeof(tRoot) == "Instance") and tRoot.Position or tRoot
+                    local dist = (pos - myRoot.Position).Magnitude
+                    
+                    if dist < minDist then
+                        closest = t.Name
+                        minDist = dist
+                    end
+                end
+            end
+            
+            if btnAutoCrate then
+                 -- Mise à jour du texte du bouton Vol Caisses avec la localisation
+                 if isCrateFarming then
+                     btnAutoCrate.Text = "Vol Caisses: ON (" .. closest .. ")"
+                 else
+                     -- Si désactivé, on garde juste OFF
+                     btnAutoCrate.Text = "Vol Caisses: OFF"
+                 end
+            end
+        end
+        task.wait(0.5)
     end
 end)
 
