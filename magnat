@@ -136,6 +136,7 @@ local isCrateFarming = false
 local isProcessing = false
 local farmingConnection = nil
 local crateThread = nil
+local lastCrateId = nil -- Pour éviter de reprendre la même
 
 local function isBuyButton(btn)
     local neon = btn:FindFirstChild("Neon") or btn:FindFirstChild("Button")
@@ -166,78 +167,75 @@ local function collectAndSellCrate(isFallback)
     if not FARM_CONFIG.SellPosition then storeSellPosition() end
     
     local success, err = pcall(function()
-        local crates = nil
-        local attempts = 0
+        -- RECHERCHE GLOBALE ET TOTALE (SCAN TOUTE LA MAP)
+        -- On ne se limite plus à un dossier spécifique. On cherche partout.
+        updateStatus("Scan complet de la map...")
+        local allCrates = {}
         
-        while attempts < 3 do
-            local gameSystems = Workspace:FindFirstChild("Game Systems")
-            if gameSystems then
-                crates = gameSystems:FindFirstChild("Crate Workspace")
-                if crates then break end
+        -- On scanne via les PROXIMITY PROMPT (Interaction 'E')
+        -- C'est le seul moyen sûr de trouver des objets interactifs valides
+        for _, prompt in ipairs(Workspace:GetDescendants()) do
+            if prompt:IsA("ProximityPrompt") then
+                local part = prompt.Parent
+                local model = part.Parent
+                
+                -- On vérifie si c'est bien une caisse (le modèle ou la part contient "Crate")
+                if (part:IsA("BasePart") and (string.find(part.Name, "Crate") or (model and string.find(model.Name, "Crate")))) then
+                    
+                    -- On vérifie l'attribut Owner sur le modèle ou la part
+                    local owner = part:GetAttribute("Owner") or (model and model:GetAttribute("Owner"))
+                    
+                    -- Si pas à nous, on ajoute
+                    if not owner or tostring(owner) ~= plr.Name then
+                         table.insert(allCrates, part)
+                    end
+                end
             end
-            attempts = attempts + 1
-            task.wait(0.2) -- Plus rapide
         end
         
-        if not crates then crates = Workspace:FindFirstChild("Crate Workspace", true) end
-        
-        if crates then
-            local availableCrates = {}
-            for _, crate in ipairs(crates:GetChildren()) do
-                if crate.Name:find("Crate") and crate:IsA("BasePart") then
-                    local owner = crate:GetAttribute("Owner")
-                    if not owner or tostring(owner) ~= plr.Name then
-                         table.insert(availableCrates, crate)
-                    end
+        if #allCrates > 0 then
+            -- Mélange de la table pour un vrai aléatoire (Fisher-Yates Shuffle)
+            for i = #allCrates, 2, -1 do
+                local j = math.random(i)
+                allCrates[i], allCrates[j] = allCrates[j], allCrates[i]
+            end
+            
+            local selectedCrate = nil
+            
+            -- On cherche une caisse différente de la dernière
+            for _, c in ipairs(allCrates) do
+                if c ~= lastCrateId then
+                    selectedCrate = c
+                    break
                 end
             end
             
-            if #availableCrates == 0 then
-                 updateStatus("Attente spawn...")
-                 task.wait(2)
-                 for _, crate in ipairs(crates:GetChildren()) do
-                    if crate.Name:find("Crate") and crate:IsA("BasePart") then
-                        local owner = crate:GetAttribute("Owner")
-                        if not owner or tostring(owner) ~= plr.Name then
-                             table.insert(availableCrates, crate)
-                        end
-                    end
-                end
-            end
+            -- Si on n'a rien trouvé (ou une seule caisse dispo), on prend la première
+            if not selectedCrate then selectedCrate = allCrates[1] end
             
-            if #availableCrates > 0 then
-                local randomIndex = math.random(1, #availableCrates)
-                local crate = availableCrates[randomIndex]
-                
-                if not isFallback and not isCrateFarming then return end
-                
-                updateStatus("Vol Caisse...")
+            lastCrateId = selectedCrate
+            
+            if not isFallback and not isCrateFarming then return end
+            
+            updateStatus("Vol Caisse (Aléatoire)...")
                 local root = getRoot()
                 
-                if crate and crate.CFrame then
+                if selectedCrate and selectedCrate.CFrame then
                     -- TP simple à côté de la caisse
                     -- Plus aucun blocage ni fantôme
-                    root.CFrame = crate.CFrame * CFrame.new(3, 1, 0)
+                    root.CFrame = selectedCrate.CFrame * CFrame.new(3, 1, 0)
                 else
                     return
                 end
                 
-                task.wait(0.5)
+                task.wait(0.2) -- Délai infime avant d'appuyer (0.2s)
                 
                 VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
                 
-                -- ATTENTE INTELLIGENTE (Au lieu d'attendre 5.5s bêtement)
-                -- On attend que la caisse disparaisse (signe qu'elle est prise)
-                -- Ou un maximum de 6 secondes (sécurité)
-                local startTime = tick()
-                while crate.Parent and tick() - startTime < 6 do
-                    -- On vérifie si la caisse a changé de propriétaire ou a disparu
-                    local owner = crate:GetAttribute("Owner")
-                    if owner and tostring(owner) == plr.Name then
-                        break -- C'est à nous !
-                    end
-                    task.wait(0.1)
-                end
+                -- TEMPS DE CAPTURE FIXE ET RAPIDE
+                -- On attend juste le temps nécessaire pour remplir la barre (5.5s environ)
+                -- Dès que c'est fini, on part INSTANTANÉMENT
+                task.wait(5.5) 
                 
                 VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
                 
